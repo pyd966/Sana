@@ -238,6 +238,10 @@ def main():
             kv_splits=os.environ.get("WAN22_SOL_KV_SPLITS", "auto"),
             dense_steps=int(os.environ.get("WAN22_SOL_DENSE_STEPS", "0")),
             dense_layers=os.environ.get("WAN22_SOL_DENSE_LAYERS", ""),
+            # First-order Taylor (anchor) indexer; 0 keeps mean pooling.
+            num_anchors=int(os.environ.get("WAN22_SOL_ANCHORS", "0")),
+            anchor_temperature=float(os.environ.get("WAN22_SOL_ANCHOR_TEMP", "inf")),
+            anchor_mode=os.environ.get("WAN22_SOL_ANCHOR_MODE", "position"),
         )
         # GLOBAL Morton3D reorder: permute tokens + RoPE once at the block stack, not
         # per attention call (FFN/norm/residual are per-token, order-invariant).

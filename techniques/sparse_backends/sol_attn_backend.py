@@ -28,6 +28,8 @@ from typing import Callable
 HEAD_DIM = 128
 DEFAULT_TAU = 1.0
 DEFAULT_THRESH_TYPE = "diag"
+DEFAULT_ANCHOR_TEMPERATURE = float("inf")
+DEFAULT_ANCHOR_MODE = "position"
 _DEFAULT_SCALE = HEAD_DIM**-0.5
 _PACKAGE_ROOT = Path(__file__).resolve().parent / "sol_attn"
 _IMPORT_ROOT = _PACKAGE_ROOT.parent
@@ -127,6 +129,9 @@ def _run_sol_attn_bthd(
     sink_start: int | None = None,
     sink_tokens: int = 0,
     dense_fn: Callable | None = None,
+    num_anchors: int = 0,
+    anchor_temperature: float = DEFAULT_ANCHOR_TEMPERATURE,
+    anchor_mode: str = DEFAULT_ANCHOR_MODE,
 ):
     """Run Sol-Attn on contiguous BTHD tensors, with a safe dense fallback."""
 
@@ -148,6 +153,15 @@ def _run_sol_attn_bthd(
 
     try:
         kernel = _load_sol_attn()
+        anchor_kwargs = {}
+        if int(num_anchors) > 0:
+            # Anchor indexer lives in the Triton backend and is single-split.
+            anchor_kwargs = dict(
+                num_anchors=int(num_anchors),
+                anchor_temperature=float(anchor_temperature),
+                anchor_mode=str(anchor_mode),
+            )
+            kv_splits = 1
         out = kernel(
             q0,
             k0,
@@ -157,6 +171,7 @@ def _run_sol_attn_bthd(
             kv_splits=_resolve_kv_splits(q0, kv_splits),
             sink_start=sink_start,
             sink_tokens=int(sink_tokens),
+            **anchor_kwargs,
         )
         _SOL_STATS["kernel_calls"] += 1
         return out
@@ -258,6 +273,9 @@ class _SolContext:
     video_len = 0
     grid = None
     morton = False
+    num_anchors = 0
+    anchor_temperature = DEFAULT_ANCHOR_TEMPERATURE
+    anchor_mode = DEFAULT_ANCHOR_MODE
 
 
 _SOL_CTX = _SolContext()
@@ -343,6 +361,9 @@ def _ensure_self_op() -> None:
             tau=_SOL_CTX.tau,
             thresh_type=_SOL_CTX.thresh_type,
             kv_splits=_SOL_CTX.kv_splits,
+            num_anchors=_SOL_CTX.num_anchors,
+            anchor_temperature=_SOL_CTX.anchor_temperature,
+            anchor_mode=_SOL_CTX.anchor_mode,
         )
 
     @self_attention.register_fake
@@ -350,6 +371,12 @@ def _ensure_self_op() -> None:
         return torch.empty_like(q)
 
     _SELF_OP_REGISTERED = True
+
+
+def _set_anchor_context(num_anchors, anchor_temperature, anchor_mode) -> None:
+    _SOL_CTX.num_anchors = int(num_anchors)
+    _SOL_CTX.anchor_temperature = float(anchor_temperature)
+    _SOL_CTX.anchor_mode = str(anchor_mode)
 
 
 def make_sol_attn_dispatch(
@@ -360,14 +387,23 @@ def make_sol_attn_dispatch(
     kv_splits: int | str | None = "auto",
     dense_steps: int = 0,
     dense_layers: str = "",
+    num_anchors: int = 0,
+    anchor_temperature: float = DEFAULT_ANCHOR_TEMPERATURE,
+    anchor_mode: str = DEFAULT_ANCHOR_MODE,
 ):
-    """Wrap diffusers self-attention with the released Sol-Attn BTHD API."""
+    """Wrap diffusers self-attention with the released Sol-Attn BTHD API.
+
+    ``num_anchors > 0`` enables the first-order Taylor (anchor) block indexer
+    with ``num_anchors`` anchors per head and softmax temperature
+    ``anchor_temperature``; see :mod:`sol_attn.anchor`.
+    """
 
     _SOL_CTX.tau = float(tau)
     _SOL_CTX.thresh_type = str(thresh_type)
     _SOL_CTX.kv_splits = kv_splits
     _SOL_CTX.dense_steps = int(dense_steps)
     _SOL_CTX.dense_layers = _parse_layer_ranges(dense_layers)
+    _set_anchor_context(num_anchors, anchor_temperature, anchor_mode)
     _ensure_self_op()
     import torch
 
@@ -456,6 +492,9 @@ def _run_mmdit_sol_attn_bthd(
     kv_splits: int | str | None = "auto",
     grid=None,
     morton: bool = False,
+    num_anchors: int = 0,
+    anchor_temperature: float = DEFAULT_ANCHOR_TEMPERATURE,
+    anchor_mode: str = DEFAULT_ANCHOR_MODE,
 ):
     """Run joint MMDiT attention with exact text K/V and dense text Q.
 
@@ -532,6 +571,9 @@ def _run_mmdit_sol_attn_bthd(
             kv_splits=kv_splits,
             sink_start=video_len,
             sink_tokens=text_tokens,
+            num_anchors=num_anchors,
+            anchor_temperature=anchor_temperature,
+            anchor_mode=anchor_mode,
         ).transpose(1, 2)
         out_joint = out_joint.index_select(2, inverse_joint)
 
@@ -589,6 +631,9 @@ def _ensure_hunyuan_op() -> None:
             kv_splits=_SOL_CTX.kv_splits,
             grid=_SOL_CTX.grid,
             morton=_SOL_CTX.morton,
+            num_anchors=_SOL_CTX.num_anchors,
+            anchor_temperature=_SOL_CTX.anchor_temperature,
+            anchor_mode=_SOL_CTX.anchor_mode,
         )
 
     @hunyuan_attention.register_fake
@@ -609,6 +654,9 @@ def make_mmdit_sol_attn_dispatch(
     dense_layers: str = "",
     grid=None,
     morton: bool = False,
+    num_anchors: int = 0,
+    anchor_temperature: float = DEFAULT_ANCHOR_TEMPERATURE,
+    anchor_mode: str = DEFAULT_ANCHOR_MODE,
 ):
     """Wrap joint MMDiT attention with exact text K/V and dense text Q."""
 
@@ -620,6 +668,7 @@ def make_mmdit_sol_attn_dispatch(
     _SOL_CTX.dense_layers = _parse_layer_ranges(dense_layers)
     _SOL_CTX.grid = None if grid is None else tuple(int(value) for value in grid)
     _SOL_CTX.morton = bool(morton)
+    _set_anchor_context(num_anchors, anchor_temperature, anchor_mode)
     _ensure_hunyuan_op()
     import torch
 

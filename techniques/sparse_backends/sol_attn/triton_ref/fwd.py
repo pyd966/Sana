@@ -44,12 +44,17 @@ def _forward_tma(
     kc_desc,
     vc_desc,
     threshold,
+    bias_ptr,
+    assign_ptr,
     o_desc,
     scale,
     T,
+    NPAD,
     sink_start_block,
     sink_end_block,
     HAS_SINK: tl.constexpr,
+    HAS_ANCHOR: tl.constexpr,
+    A: tl.constexpr,
     H: tl.constexpr,
     D: tl.constexpr,
     NT: tl.constexpr,
@@ -83,19 +88,37 @@ def _forward_tma(
     route_threshold = tl.load(
         threshold + (batch * NT + q_block) * H + head
     )
+    # Anchor indexer: the summaries carry a pseudo-head axis [head, anchor];
+    # each query block reads the slice of the anchor it was assigned to.
+    if HAS_ANCHOR:
+        anchor = tl.load(assign_ptr + (batch * NT + q_block) * H + head)
+        kc_head = head * A + anchor
+    else:
+        kc_head = head
 
     for group_start in range(0, NT, GROUP_SIZE):
         block_indices = group_start + group_offsets
         valid = block_indices < NT
         kc = kc_desc.load(
-            [batch, group_start, head, 0]
+            [batch, group_start, kc_head, 0]
         ).reshape([GROUP_SIZE, D])
         vc = vc_desc.load(
-            [batch, group_start, head, v_tile * BV]
+            [batch, group_start, kc_head, v_tile * BV]
         ).reshape([GROUP_SIZE, BV])
         scores = tl.dot(q, kc.T).to(tl.float32) * scale_log2
+        column_mean = tl.sum(scores, axis=0) / q_len
+        if HAS_ANCHOR:
+            # Entropy bias in log2 units; added after the column mean so the
+            # zero-padded tail query rows do not dilute it.
+            bias = tl.load(
+                bias_ptr + (batch * NPAD + block_indices) * (H * A) + kc_head,
+                mask=valid,
+                other=0.0,
+            )
+            column_mean = column_mean + bias
+            scores = scores + bias[None, :]
         exact = (
-            (tl.sum(scores, axis=0) / q_len > route_threshold)
+            (column_mean > route_threshold)
             | (tl.abs(q_block - block_indices) <= 1)
         )
         if HAS_SINK:
@@ -122,13 +145,17 @@ def _forward_tma(
             approximate_probability.to(vc.dtype),
             vc,
         )
-        lengths = tl.where(
-            block_indices == NT - 1, tail_length, BLOCK_SIZE
-        ).to(tl.float32)
-        row_sum = row_sum * alpha + tl.sum(
-            approximate_probability * lengths[None, :],
-            axis=1,
-        )
+        if HAS_ANCHOR:
+            # The block count is already inside exp2(bias); vc is a mean.
+            row_sum = row_sum * alpha + tl.sum(approximate_probability, axis=1)
+        else:
+            lengths = tl.where(
+                block_indices == NT - 1, tail_length, BLOCK_SIZE
+            ).to(tl.float32)
+            row_sum = row_sum * alpha + tl.sum(
+                approximate_probability * lengths[None, :],
+                axis=1,
+            )
         row_max = new_max
 
         exact_offsets = tl.where(exact, group_offsets, GROUP_SIZE)
@@ -191,6 +218,8 @@ def _forward_ptr(
     kc_ptr,
     vc_ptr,
     threshold_ptr,
+    bias_ptr,
+    assign_ptr,
     o_ptr,
     scale,
     T,
@@ -198,6 +227,8 @@ def _forward_ptr(
     sink_start_block,
     sink_end_block,
     HAS_SINK: tl.constexpr,
+    HAS_ANCHOR: tl.constexpr,
+    A: tl.constexpr,
     H: tl.constexpr,
     D: tl.constexpr,
     NT: tl.constexpr,
@@ -237,23 +268,37 @@ def _forward_ptr(
     route_threshold = tl.load(
         threshold_ptr + (batch * NT + q_block) * H + head
     )
+    if HAS_ANCHOR:
+        anchor = tl.load(assign_ptr + (batch * NT + q_block) * H + head)
+        kc_head = head * A + anchor
+    else:
+        kc_head = head
 
     for group_start in range(0, NT, GROUP_SIZE):
         block_indices = group_start + group_offsets
         valid = block_indices < NT
         kc_offsets = (
-            ((batch * NPAD + block_indices[:, None]) * H + head) * D
+            ((batch * NPAD + block_indices[:, None]) * (H * A) + kc_head) * D
             + dims[None, :]
         )
         vc_offsets = (
-            ((batch * NPAD + block_indices[:, None]) * H + head) * D
+            ((batch * NPAD + block_indices[:, None]) * (H * A) + kc_head) * D
             + value_dims[None, :]
         )
         kc = tl.load(kc_ptr + kc_offsets)
         vc = tl.load(vc_ptr + vc_offsets)
         scores = tl.dot(q, kc.T).to(tl.float32) * scale_log2
+        column_mean = tl.sum(scores, axis=0) / q_len
+        if HAS_ANCHOR:
+            bias = tl.load(
+                bias_ptr + (batch * NPAD + block_indices) * (H * A) + kc_head,
+                mask=valid,
+                other=0.0,
+            )
+            column_mean = column_mean + bias
+            scores = scores + bias[None, :]
         exact = (
-            (tl.sum(scores, axis=0) / q_len > route_threshold)
+            (column_mean > route_threshold)
             | (tl.abs(q_block - block_indices) <= 1)
         )
         if HAS_SINK:
@@ -289,14 +334,17 @@ def _forward_ptr(
             probability.to(vc.dtype),
             vc,
         )
-        lengths = tl.minimum(
-            BLOCK_SIZE,
-            tl.maximum(0, T - block_indices * BLOCK_SIZE),
-        ).to(tl.float32)
-        row_sum = row_sum * alpha + tl.sum(
-            probability * lengths[None, :],
-            axis=1,
-        )
+        if HAS_ANCHOR:
+            row_sum = row_sum * alpha + tl.sum(probability, axis=1)
+        else:
+            lengths = tl.minimum(
+                BLOCK_SIZE,
+                tl.maximum(0, T - block_indices * BLOCK_SIZE),
+            ).to(tl.float32)
+            row_sum = row_sum * alpha + tl.sum(
+                probability * lengths[None, :],
+                axis=1,
+            )
         row_max = new_max
 
         exact_offsets = tl.where(exact, group_offsets, GROUP_SIZE)
@@ -373,8 +421,17 @@ def sol_attn(
     thresh_type: str = "diag",
     sink_tokens: int = 0,
     sink_start: int | None = None,
+    num_anchors: int = 0,
+    anchor_temperature: float = float("inf"),
+    anchor_mode: str = "position",
 ) -> torch.Tensor:
-    """Run Triton Sol-Attn on contiguous BF16 BTHD inputs."""
+    """Run Triton Sol-Attn on contiguous BF16 BTHD inputs.
+
+    ``num_anchors > 0`` switches the block indexer from mean pooling to the
+    first-order Taylor (anchor) summaries of :mod:`sol_attn.anchor`, with
+    ``num_anchors`` anchors per head chosen by ``anchor_mode`` and softmax
+    temperature ``anchor_temperature`` (``inf`` reproduces mean pooling).
+    """
 
     arch = _validate_inputs(
         q,
@@ -399,8 +456,27 @@ def sol_attn(
         sink_tokens,
     )
     use_tma = _use_tma(q.device)
+    use_anchor = int(num_anchors) > 0
 
-    if use_tma:
+    if use_anchor:
+        from ..anchor import prepare_anchor
+
+        prepared = prepare_anchor(
+            q,
+            k,
+            v,
+            scale=scale,
+            tau=tau,
+            thresh_type=thresh_type,
+            num_anchors=int(num_anchors),
+            temperature=float(anchor_temperature),
+            anchor_mode=anchor_mode,
+        )
+        kc, vc = prepared["kc"], prepared["vc"]
+        threshold = prepared["threshold"]
+        bias, assign = prepared["bias"], prepared["assign"]
+        anchors_per_head = int(prepared["num_anchors"])
+    elif use_tma:
         # Keep the original descriptor-backed preprocessing on TMA devices.
         # The pointer preprocessing below exists only for older architectures.
         from ..preprocess import prepare as prepare_tma
@@ -413,7 +489,21 @@ def sol_attn(
             tau=tau,
             thresh_type=thresh_type,
         )
-        output = torch.empty_like(v)
+        bias, assign, anchors_per_head = threshold, threshold, 1
+    else:
+        kc, vc, threshold = prepare_ptr(
+            q,
+            k,
+            v,
+            scale=scale,
+            tau=tau,
+            thresh_type=thresh_type,
+            tokens=tokens,
+        )
+        bias, assign, anchors_per_head = threshold, threshold, 1
+
+    output = torch.empty_like(v)
+    if use_tma:
         block_shape = [1, BLOCK, 1, head_dim]
         summary_shape = [1, GROUP, 1, head_dim]
         _forward_tma[(1, blocks, batch * heads)](
@@ -423,12 +513,17 @@ def sol_attn(
             TensorDescriptor.from_tensor(kc, summary_shape),
             TensorDescriptor.from_tensor(vc, summary_shape),
             threshold,
+            bias,
+            assign,
             TensorDescriptor.from_tensor(output, block_shape),
             scale,
             tokens,
+            kc.shape[1],
             sink_start_block,
             sink_end_block,
             sink_tokens > 0,
+            use_anchor,
+            anchors_per_head,
             heads,
             head_dim,
             blocks,
@@ -438,16 +533,6 @@ def sol_attn(
         )
         return output
 
-    kc, vc, threshold = prepare_ptr(
-        q,
-        k,
-        v,
-        scale=scale,
-        tau=tau,
-        thresh_type=thresh_type,
-        tokens=tokens,
-    )
-    output = torch.empty_like(v)
     grid = lambda meta: (head_dim // meta["BV"], blocks, batch * heads)
     _forward_ptr[grid](
         q,
@@ -456,6 +541,8 @@ def sol_attn(
         kc,
         vc,
         threshold,
+        bias,
+        assign,
         output,
         scale,
         tokens,
@@ -463,6 +550,8 @@ def sol_attn(
         sink_start_block,
         sink_end_block,
         HAS_SINK=sink_tokens > 0,
+        HAS_ANCHOR=use_anchor,
+        A=anchors_per_head,
         H=heads,
         D=head_dim,
         NT=blocks,

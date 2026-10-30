@@ -163,6 +163,10 @@ def main() -> int:
             kv_splits=os.environ.get("HUNYUAN_SOL_KV_SPLITS", "auto"),
             dense_steps=int(os.environ.get("HUNYUAN_SOL_DENSE_STEPS", "0")),
             dense_layers=os.environ.get("HUNYUAN_SOL_DENSE_LAYERS", ""),
+            # First-order Taylor (anchor) indexer; 0 keeps mean pooling.
+            num_anchors=int(os.environ.get("HUNYUAN_SOL_ANCHORS", "0")),
+            anchor_temperature=float(os.environ.get("HUNYUAN_SOL_ANCHOR_TEMP", "inf")),
+            anchor_mode=os.environ.get("HUNYUAN_SOL_ANCHOR_MODE", "position"),
             grid=_grid,
             video_len=_video_len,
             morton=os.environ.get("HUNYUAN_SOL_MORTON", "0") == "1",

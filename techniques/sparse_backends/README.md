@@ -156,6 +156,30 @@ Sol-Engine adapters fall back to dense attention when a call is ineligible or
 a backend fails. Set `SOL_ATTN_STRICT=1` during validation to raise the original
 error instead.
 
+## Anchor (first-order Taylor) indexer — research path
+
+Mean pooling is the first-order Taylor expansion of the block log-partition
+``log Σ exp(s q·k)`` at ``q = 0``. The anchor indexer expands at one or more
+per-head anchor queries instead: each block is summarised by a softmax-weighted
+key ``k'``, value ``v'`` and an entropy bias ``b'`` (``log`` effective keys), so
+the proxy score becomes ``s q·k' + b'``. A softmax temperature slides the
+expansion point back toward the origin; ``inf`` reproduces mean pooling.
+
+```python
+out = sol_attn(
+    q, k, v,
+    tau=1.0,
+    num_anchors=8,            # anchors per head; 0 = mean pooling (default)
+    anchor_temperature=2.0,   # inf = mean pooling
+    anchor_mode="position",   # or "kmeans"
+)
+```
+
+Implemented in the Triton backend only (CUDA devices are routed to it when
+``num_anchors > 0``); preprocessing lives in `sol_attn/anchor.py` and is plain
+PyTorch. `tools/anchor_indexer_eval.py` compares indexers offline against the
+exact block log-partition; see `docs/anchor_indexer.md` at the repository root.
+
 ## Triton research implementation
 
 The Triton implementation can also be selected explicitly for portability,

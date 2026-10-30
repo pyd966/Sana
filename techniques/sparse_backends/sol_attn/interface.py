@@ -57,6 +57,15 @@ def _validate_inputs(
     return tuple(torch.cuda.get_device_capability(q.device))
 
 
+def _validate_anchor(num_anchors, anchor_temperature, anchor_mode):
+    if not isinstance(num_anchors, int) or num_anchors < 0:
+        raise ValueError("num_anchors must be a non-negative integer")
+    if not float(anchor_temperature) > 0:
+        raise ValueError("anchor_temperature must be positive (inf allowed)")
+    if anchor_mode not in ("position", "kmeans"):
+        raise ValueError("anchor_mode must be 'position' or 'kmeans'")
+
+
 @functools.lru_cache(maxsize=1)
 def _cute_runtime_available() -> bool:
     """Whether the optional CuTe DSL runtime can be imported."""
@@ -421,12 +430,22 @@ def sol_attn(
     kv_splits: int = 1,
     sink_tokens: int = 0,
     sink_start: int | None = None,
+    num_anchors: int = 0,
+    anchor_temperature: float = float("inf"),
+    anchor_mode: str = "position",
 ) -> torch.Tensor:
     """Compute noncausal Sol-Attn for contiguous BF16 BTHD tensors.
 
     ``sink_start`` and ``sink_tokens`` keep every KV block overlapping the
     corresponding contiguous token range exact for all queries. Omitting
     ``sink_start`` places the range at the token suffix.
+
+    ``num_anchors > 0`` replaces the mean-pooling block indexer with the
+    first-order Taylor (anchor) indexer: ``num_anchors`` anchor queries per
+    head (``anchor_mode`` ``"position"`` or ``"kmeans"``) and softmax
+    temperature ``anchor_temperature`` (``inf`` degenerates to mean pooling).
+    The anchor indexer is implemented in the Triton backend only; CUDA
+    devices are routed to it automatically.
     """
 
     arch = _validate_inputs(
@@ -439,9 +458,19 @@ def sol_attn(
     )
     if kv_splits not in (1, 2, 4):
         raise ValueError("kv_splits must be 1, 2, or 4")
+    _validate_anchor(num_anchors, anchor_temperature, anchor_mode)
     backend = "metal" if arch is None else _backend_for_arch(arch)
     scale = q.shape[-1] ** -0.5 if scale is None else float(scale)
     tau = float(tau)
+
+    if num_anchors > 0:
+        if backend == "metal":
+            raise NotImplementedError(
+                "the anchor indexer is not available on the Metal backend"
+            )
+        if kv_splits != 1:
+            raise ValueError("the anchor indexer requires kv_splits=1")
+        backend = "triton"
 
     if backend == "metal":
         from .mps import sol_attn as mps_sol_attn
@@ -472,6 +501,9 @@ def sol_attn(
             thresh_type=thresh_type,
             sink_tokens=sink_tokens,
             sink_start=sink_start,
+            num_anchors=int(num_anchors),
+            anchor_temperature=float(anchor_temperature),
+            anchor_mode=anchor_mode,
         )
 
     _validate_cute(arch, q.shape[1], kv_splits)
